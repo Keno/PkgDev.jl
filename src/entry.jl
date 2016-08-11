@@ -33,7 +33,8 @@ function pull_request(dir::AbstractString; commit::AbstractString="", url::Abstr
         fork = response["clone_url"]
         info("Pushing changes as branch $branch")
         refspecs = ["HEAD:refs/heads/$branch"]  # workaround for $commit:refs/heads/$branch
-        LibGit2.push(repo, remoteurl=fork, refspecs=refspecs, force=force_branch, payload=GitHub.credentials())
+        fork, payload = push_url_and_credentials(fork)
+        LibGit2.push(repo, remoteurl=fork, refspecs=refspecs, force=force_branch, payload=payload)
         pr_url = "$(response["html_url"])/compare/$branch"
         info("To create a pull-request, open:\n\n  $pr_url\n")
     end
@@ -45,8 +46,18 @@ function submit(pkg::AbstractString, commit::AbstractString="")
     pull_request(PkgDev.dir(pkg), commit=commit, url=url)
 end
 
+function push_url_and_credentials(url)
+    payload = Nullable{LibGit2.AbstractCredentials}()
+    m = match(LibGit2.GITHUB_REGEX,url)
+    if m !== nothing
+        url = "https://github.com/$(m.captures[1]).git"
+        payload = GitHub.credentials()
+    end
+    url, payload
+end
+
 function publish(branch::AbstractString, prbranch::AbstractString="")
-    tags = Dict{ByteString,Vector{ASCIIString}}()
+    tags = Dict{ByteString,Vector{String}}()
     metapath = Pkg.dir("METADATA")
     with(GitRepo, metapath) do repo
         LibGit2.branch(repo) == branch ||
@@ -70,7 +81,7 @@ function publish(branch::AbstractString, prbranch::AbstractString="")
                 tag_name = "v$ver"
                 tag_commit = LibGit2.revparseid(pkg_repo, "$(tag_name)^{commit}")
                 LibGit2.iszero(tag_commit) || string(tag_commit) == sha1 || return false
-                haskey(tags,pkg) || (tags[pkg] = ASCIIString[])
+                haskey(tags,pkg) || (tags[pkg] = String[])
                 push!(tags[pkg], tag_name)
                 return true
             end || throw(PkgError("$pkg v$ver is incorrectly tagged – $sha1 expected"))
@@ -82,23 +93,25 @@ function publish(branch::AbstractString, prbranch::AbstractString="")
 
     for pkg in sort!(collect(keys(tags)))
         with(GitRepo, PkgDev.dir(pkg)) do pkg_repo
-            forced = ASCIIString[]
-            unforced = ASCIIString[]
+            forced = String[]
+            unforced = String[]
             for tag in tags[pkg]
                 ver = convert(VersionNumber,tag)
                 push!(isrewritable(ver) ? forced : unforced, tag)
             end
+            remoteurl, payload = push_url_and_credentials(
+                LibGit2.url(LibGit2.get(LibGit2.GitRemote, pkg_repo, "origin")))
             if !isempty(forced)
                 info("Pushing $pkg temporary tags: ", join(forced,", "))
-                LibGit2.push(pkg_repo, remote="origin", force=true,
+                LibGit2.push(pkg_repo, remote="origin", remoteurl=remoteurl, force=true,
                              refspecs=["refs/tags/$tag:refs/tags/$tag" for tag in forced],
-                             payload=GitHub.credentials())
+                             payload=payload)
             end
             if !isempty(unforced)
                 info("Pushing $pkg permanent tags: ", join(unforced,", "))
-                LibGit2.push(pkg_repo, remote="origin",
+                LibGit2.push(pkg_repo, remote="origin", remoteurl=remoteurl,
                              refspecs=["refs/tags/$tag:refs/tags/$tag" for tag in unforced],
-                             payload=GitHub.credentials())
+                             payload=payload)
             end
         end
     end
